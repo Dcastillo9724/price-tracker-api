@@ -105,6 +105,7 @@ class CategorySerializer(serializers.ModelSerializer):
         model = Category
         fields = [
             'id',
+            'store',
             'store_name',
             'store_code',
             'name',
@@ -114,7 +115,7 @@ class CategorySerializer(serializers.ModelSerializer):
             'products_count',
             'is_active'
         ]
-        read_only_fields = ['id']
+        read_only_fields = ['id', 'store_name', 'store_code', 'full_path', 'products_count']
 
     def get_full_path(self, obj: Category) -> str:
         """
@@ -132,6 +133,34 @@ class CategorySerializer(serializers.ModelSerializer):
             parent = parent.parent
 
         return ' > '.join(reversed(path))
+    
+    def validate(self, attrs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validación a nivel de objeto.
+        
+        Args:
+            attrs: Atributos de la categoría
+        
+        Returns:
+            Atributos validados
+        
+        Raises:
+            ValidationError: Si parent no pertenece a la misma tienda
+        """
+        parent = attrs.get('parent')
+        store = attrs.get('store')
+        
+        # Si estamos actualizando, obtener store de la instancia si no viene en attrs
+        if not store and self.instance:
+            store = self.instance.store
+        
+        # Validar que parent pertenece a la misma tienda
+        if parent and store and parent.store != store:
+            raise serializers.ValidationError({
+                'parent': 'La categoría padre debe pertenecer a la misma tienda'
+            })
+        
+        return attrs
 
 
 class CategoryTreeSerializer(serializers.ModelSerializer):

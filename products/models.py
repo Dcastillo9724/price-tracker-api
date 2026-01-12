@@ -193,6 +193,36 @@ class Category(models.Model):
         if self.parent:
             return f"{self.store.code} | {self.parent.name} > {self.name}"
         return f"{self.store.code} | {self.name}"
+    
+    def get_full_path(self) -> str:
+        """
+        Retorna la ruta jerárquica completa de la categoría.
+        
+        Returns:
+            Ruta completa separada por ' > '
+            Ejemplo: 'Electrónica > Computadores > Portátiles'
+        """
+        path = [self.name]
+        parent = self.parent
+        
+        while parent:
+            path.append(parent.name)
+            parent = parent.parent
+        
+        return ' > '.join(reversed(path))
+    
+    def get_all_children(self) -> List['Category']:
+        """
+        Retorna todas las subcategorías recursivamente.
+        
+        Returns:
+            Lista de categorías hijas y sus descendientes
+        """
+        children = []
+        for child in self.children.filter(is_active=True):
+            children.append(child)
+            children.extend(child.get_all_children())
+        return children
 
 
 class Product(models.Model):

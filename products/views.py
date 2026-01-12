@@ -175,7 +175,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.filter(is_active=True)
     serializer_class = CategorySerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ['parent']
+    filterset_fields = ['parent', 'store']
     search_fields = ['name']
     
     def get_queryset(self) -> QuerySet[Category]:
@@ -188,7 +188,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
         queryset = super().get_queryset()
         
         if self.action == 'list':
-            queryset = queryset.select_related('parent').prefetch_related('products')
+            queryset = queryset.select_related('store', 'parent').prefetch_related('products')
         
         return queryset
     

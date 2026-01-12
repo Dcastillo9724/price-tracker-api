@@ -53,7 +53,6 @@ class StoreAdmin(admin.ModelAdmin):
     list_filter = ('is_active', 'scraping_enabled')
     search_fields = ('name', 'code')
     readonly_fields = ('created_at', 'updated_at')
-    
     fieldsets = (
         ('Información Básica', {
             'fields': ('name', 'code', 'base_url')
@@ -170,18 +169,21 @@ class CategoryAdmin(admin.ModelAdmin):
     
     list_display = (
         'name',
+        'get_store_display',
         'parent',
         'get_full_path',
         'is_active_display',
-        'get_products_count'
-    , 'url')
-    list_filter = ('is_active', 'parent')
+        'get_products_count',
+        'url'
+    )
+    list_filter = ('is_active', 'store', 'parent')
     search_fields = ('name',)
     readonly_fields = ('created_at', 'updated_at')
+    raw_id_fields = ('parent',)
     
     fieldsets = (
         ('Información Básica', {
-            'fields': ('name', 'parent')
+            'fields': ('store', 'name', 'parent', 'url')
         }),
         ('Contenido', {
             'fields': ('description',)
@@ -206,10 +208,24 @@ class CategoryAdmin(admin.ModelAdmin):
             QuerySet optimizado
         """
         qs = super().get_queryset(request)
-        return qs.select_related('parent').annotate(
+        return qs.select_related('store', 'parent').annotate(
             products_count=Count('products', distinct=True)
         )
     
+    def get_store_display(self, obj: Category) -> str:
+        """
+        Retorna el código y nombre de la tienda.
+        
+        Args:
+            obj: Instancia de Category
+        
+        Returns:
+            Código y nombre de tienda
+        """
+        return f"{obj.store.code} - {obj.store.name}"
+    get_store_display.short_description = 'Tienda'
+    get_store_display.admin_order_field = 'store__name'
+
     def get_full_path(self, obj: Category) -> str:
         """
         Retorna la ruta completa de la categoría.

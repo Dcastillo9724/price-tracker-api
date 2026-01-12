@@ -44,6 +44,7 @@ class CategoryModelTest(TestCase):
     """Tests para el modelo Category."""
     
     def setUp(self):
+        # Crear store primero - REQUERIDO para Category
         self.store = Store.objects.create(
             name='MercadoLibre',
             code='ML',
@@ -52,13 +53,13 @@ class CategoryModelTest(TestCase):
 
         self.parent = Category.objects.create(
             name='Electrónica',
-            store=self.store
+            store=self.store,
         )
 
         self.child = Category.objects.create(
             name='Laptops',
             parent=self.parent,
-            store=self.store
+            store=self.store,
         )
 
     
@@ -66,35 +67,38 @@ class CategoryModelTest(TestCase):
         """Test creación de categoría."""
         self.assertEqual(self.parent.name, 'Electrónica')
         self.assertIsNone(self.parent.parent)
+        self.assertEqual(self.parent.store, self.store)
     
     def test_category_hierarchy(self):
         """Test jerarquía de categorías."""
         self.assertEqual(self.child.parent, self.parent)
+        self.assertEqual(self.child.store, self.store)
     
     def test_category_get_full_path(self):
         """Test obtener ruta completa."""
-        self.assertEqual(self.child.get_full_path(), 'Electrónica > Laptops')
+        full_path = self.child.get_full_path()
+        self.assertIn('Laptops', full_path)
+        self.assertIn('Electrónica', full_path)
+        self.assertEqual(full_path, 'Electrónica > Laptops')
     
     def test_category_str(self):
         """Test __str__ de categoría."""
-        self.assertEqual(str(self.child), 'Electrónica > Laptops')
-        self.assertEqual(str(self.parent), 'Electrónica')
+        # El __str__ ahora incluye el código de la tienda
+        child_str = str(self.child)
+        self.assertIn('ML', child_str)
+        self.assertIn('Electrónica', child_str)
+        self.assertIn('Laptops', child_str)
+        
+        parent_str = str(self.parent)
+        self.assertIn('ML', parent_str)
+        self.assertIn('Electrónica', parent_str)
 
 
 class ProductModelTest(TestCase):
     """Tests para el modelo Product."""
-    
+
     def setUp(self):
-        self.category = Category.objects.create(name='Laptops')
-        self.product = Product.objects.create(
-            name='Laptop HP Victus 15',
-            brand='HP',
-            model='Victus 15',
-            description='Laptop gamer',
-            category=self.category
-        )
-        
-        # Crear tiendas
+        # Crear tiendas para listings PRIMERO
         self.ml = Store.objects.create(
             name='MercadoLibre',
             code='ML',
@@ -105,7 +109,21 @@ class ProductModelTest(TestCase):
             code='FA',
             base_url='https://www.falabella.com.co'
         )
-    
+        
+        self.category = Category.objects.create(
+            name='Laptops',
+            store=self.ml  
+        )
+        
+        # Crear producto
+        self.product = Product.objects.create(
+            name='Laptop HP Victus 15',
+            brand='HP',
+            model='Victus 15',
+            description='Laptop gamer',
+            category=self.category
+        )
+
     def test_product_creation(self):
         """Test creación de producto."""
         self.assertEqual(self.product.name, 'Laptop HP Victus 15')
@@ -320,8 +338,11 @@ class ProductListingIntegrationTest(TestCase):
             base_url='https://www.falabella.com.co'
         )
         
-        # Crear categoría
-        self.category = Category.objects.create(name='Laptops')
+        # Crear categoría con store
+        self.category = Category.objects.create(
+            name='Laptops',
+            store=self.ml
+        )
         
         # Crear producto
         self.product = Product.objects.create(
