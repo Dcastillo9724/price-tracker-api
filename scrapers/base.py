@@ -6,18 +6,21 @@ Responsabilidades:
 - Crear y finalizar ScraperRun
 - Logging estructurado de errores
 - Helpers para persistir categorías en BD (árbol de 3 niveles)
+- Persistencia idempotente de snapshots de productos y precios
 """
 
 import logging
 import traceback
 from abc import ABC, abstractmethod
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
+from django.utils import timezone
 from selenium import webdriver
 from selenium.webdriver.support.ui import WebDriverWait
 
-from products.models import Category, Store
+from products.models import Category, Price, Product, ProductListing, Store
 from scrapers.models import ScraperError, ScraperRun
 from .selenium_config import SeleniumConfig
 
@@ -37,7 +40,7 @@ class BaseScraper(ABC):
     # ----------------------------
     def setup_driver(self) -> None:
         self.driver, self.wait = SeleniumConfig.create_driver(headless=self.headless)
-        logger.info(f"Driver configurado para {self.store.name}")
+        logger.info("Driver configurado para %s", self.store.name)
 
     def teardown_driver(self) -> None:
         if self.driver:
@@ -45,19 +48,17 @@ class BaseScraper(ABC):
                 self.driver.quit()
                 logger.info("Driver cerrado exitosamente")
             except Exception as e:
-                logger.error(f"Error cerrando driver: {e}", exc_info=True)
+                logger.error("Error cerrando driver: %s", e, exc_info=True)
 
     # ----------------------------
     # Abstract API
     # ----------------------------
     @abstractmethod
     def scrape_categories(self) -> List[Dict[str, Any]]:
-        """Debe retornar árbol jerárquico de categorías."""
         raise NotImplementedError
 
     @abstractmethod
     def scrape_products(self, category_url: str) -> List[Dict[str, Any]]:
-        """(A futuro) extraer productos."""
         raise NotImplementedError
 
     # ----------------------------
@@ -70,7 +71,7 @@ class BaseScraper(ABC):
             status=ScraperRun.Status.PENDING,
         )
         self.scraper_run.mark_as_running()
-        logger.info(f"ScraperRun iniciado: {self.scraper_run.id} para {self.store.name}")
+        logger.info("ScraperRun iniciado: %s para %s", self.scraper_run.id, self.store.name)
         return self.scraper_run
 
     def finish_run(self, status: str = "COMPLETED") -> None:
@@ -84,7 +85,7 @@ class BaseScraper(ABC):
         elif status == "PARTIAL":
             self.scraper_run.mark_as_partial()
 
-        logger.info(f"ScraperRun finalizado: {self.scraper_run.id} con estado {status}")
+        logger.info("ScraperRun finalizado: %s con estado %s", self.scraper_run.id, status)
 
     # ----------------------------
     # Error logging
@@ -111,7 +112,7 @@ class BaseScraper(ABC):
         self.scraper_run.errors_count += 1
         self.scraper_run.save(update_fields=["errors_count"])
 
-        logger.error(f"Error registrado: {error_type} - {error_message}")
+        logger.error("Error registrado: %s - %s", error_type, error_message)
 
     # ----------------------------
     # Persistencia de categorías
@@ -123,28 +124,16 @@ class BaseScraper(ABC):
         parent: Optional[Category],
         url: str = "",
     ) -> Category:
-        """
-        Guarda/actualiza categoría de forma idempotente.
-        Unicidad efectiva: (store, parent, name)
-        """
-        obj, created = Category.objects.update_or_create(
+        obj, _created = Category.objects.update_or_create(
             store=self.store,
             parent=parent,
             name=name,
             defaults={"url": url} if url else {},
         )
-
-        # Si ya existía pero no tenía url y ahora sí, queda actualizada
         return obj
 
     @transaction.atomic
     def save_category_tree(self, tree: List[Dict[str, Any]]) -> int:
-        """
-        Persiste un árbol:
-        parent -> block -> leaf(url)
-
-        Retorna cantidad de nodos creados/actualizados (aprox).
-        """
         count = 0
 
         for parent_data in tree:
@@ -175,32 +164,105 @@ class BaseScraper(ABC):
         return count
 
     # ----------------------------
+    # Persistencia de productos / precios
+    # ----------------------------
+    @staticmethod
+    def _to_decimal(value: Any) -> Optional[Decimal]:
+        if value is None:
+            return None
+        if isinstance(value, Decimal):
+            return value
+        try:
+            return Decimal(str(value)).quantize(Decimal("0.01"))
+        except Exception:
+            return None
+
+    @transaction.atomic
+    def persist_product_snapshot(
+        self,
+        *,
+        category: Category,
+        product_data: Dict[str, Any],
+    ) -> Optional[ProductListing]:
+        """
+        Idempotente por (product, store) usando update_or_create.
+        Crea siempre un registro Price si hay price.
+        """
+        name = (product_data.get("name") or "").strip()
+        url = (product_data.get("url") or "").strip()
+        price = self._to_decimal(product_data.get("price"))
+        original_price = self._to_decimal(product_data.get("original_price"))
+        is_available = bool(product_data.get("is_available", True))
+
+        if not name or not url or price is None:
+            return None
+
+        product, _ = Product.objects.get_or_create(
+            name=name,
+            category=category,
+            defaults={
+                "brand": (product_data.get("brand") or "").strip(),
+                "model": (product_data.get("model") or "").strip(),
+                "description": (product_data.get("description") or "").strip(),
+                "is_active": True,
+            },
+        )
+
+        listing, _ = ProductListing.objects.update_or_create(
+            product=product,
+            store=self.store,
+            defaults={
+                "url": url,
+                "is_available": is_available,
+                "stock_status": (product_data.get("stock_status") or "").strip(),
+                "is_active": True,
+                "last_scraped_at": timezone.now(),
+            },
+        )
+
+        if original_price is not None and original_price <= price:
+            original_price = None
+
+        try:
+            Price.objects.create(
+                listing=listing,
+                price=price,
+                original_price=original_price,
+                is_available=is_available,
+            )
+        except IntegrityError as e:
+            # Si por alguna razón hay colisión rara, no tumbamos el run
+            self.log_error(
+                error_type="DB",
+                error_message=str(e),
+                url=url,
+                stack_trace=traceback.format_exc(),
+            )
+
+        return listing
+
+    # ----------------------------
     # Orquestación
     # ----------------------------
     def run(self, *, trigger_type: str = "MANUAL", scrape_type: str = "categories") -> ScraperRun:
-        """
-        Ejecuta scraping.
-        scrape_type: 'categories' o 'products' (products por ahora no hace nada)
-        """
         try:
             self.start_run(trigger_type=trigger_type)
             self.setup_driver()
 
             if scrape_type == "categories":
-                logger.info(f"Iniciando scraping de categorías para {self.store.name}")
+                logger.info("Iniciando scraping de categorías para %s", self.store.name)
                 tree = self.scrape_categories()
-                logger.info(f"Categorías extraídas (padres): {len(tree)}")
+                logger.info("Categorías extraídas (padres): %s", len(tree))
 
                 saved = self.save_category_tree(tree)
-                logger.info(f"Nodos de categorías persistidos (aprox): {saved}")
-
+                logger.info("Nodos de categorías persistidos (aprox): %s", saved)
             else:
                 logger.warning("Scraping de products aún no implementado en run()")
 
             self.finish_run("COMPLETED")
 
         except Exception as e:
-            logger.error(f"Error durante scraping: {str(e)}", exc_info=True)
+            logger.error("Error durante scraping: %s", str(e), exc_info=True)
             self.log_error(
                 error_type="OTHER",
                 error_message=str(e),
