@@ -1,684 +1,334 @@
 """
 Configuración del Django Admin para productos y tracking de precios.
 
-Este módulo registra los modelos en el panel de administración de Django
-con interfaces personalizadas para facilitar la gestión de datos.
-
-Admin Classes:
-    - StoreAdmin: Gestión de tiendas
-    - CategoryAdmin: Gestión de categorías jerárquicas
-    - ProductAdmin: Gestión de productos
-    - ProductListingAdmin: Gestión de listings
-    - PriceAdmin: Visualización de historial de precios
+Objetivo:
+- Admin cómodo para operar datos (búsqueda, filtros, acciones).
+- Performance: evitar N+1 con select_related / annotate cuando corresponda.
+- Mantener historial de precios como "append-only": Price es solo lectura.
 """
 
+from __future__ import annotations
+
+from decimal import Decimal
 from typing import Optional
 
 from django.contrib import admin
-from django.db.models import Count, QuerySet
+from django.db.models import Count, F, Q, QuerySet
 from django.http import HttpRequest
 from django.utils.html import format_html
+from django.utils.translation import gettext_lazy as _
 
 from .models import Category, Price, Product, ProductListing, Store
 
 
+
+def _icon_bool(value: bool, *, true_label: str = "✓", false_label: str = "✗") -> str:
+    return true_label if value else false_label
+
+
+def _colored(text: str, color: str) -> str:
+    return format_html('<span style="color: {};">{}</span>', color, text)
+
+
+def _money(value: Decimal) -> str:
+    # Ajusta formato si quieres decimales; por precios en COP suele ser 0 decimales.
+    return f"{value:,.0f}"
+
+
 @admin.register(Store)
 class StoreAdmin(admin.ModelAdmin):
-    """
-    Admin para el modelo Store.
-    
-    Proporciona una interfaz para gestionar tiendas con filtros
-    por estado y capacidad de búsqueda por nombre/código.
-    
-    List Display:
-        - Nombre de la tienda
-        - Código
-        - Estado activo
-        - Scraping habilitado
-        - Contador de listings activos
-    
-    Features:
-        - Filtros por is_active y scraping_enabled
-        - Búsqueda por nombre y código
-        - Acción para activar/desactivar scraping en masa
-    """
-    
+    """Admin para Store (tiendas)."""
+
     list_display = (
-        'name',
-        'code',
-        'is_active_display',
-        'scraping_enabled_display',
-        'get_listings_count'
+        "name",
+        "code",
+        "is_active_display",
+        "scraping_enabled_display",
+        "listings_count_display",
     )
-    list_filter = ('is_active', 'scraping_enabled')
-    search_fields = ('name', 'code')
-    readonly_fields = ('created_at', 'updated_at')
+    list_filter = ("is_active", "scraping_enabled", "code")
+    search_fields = ("name", "code")
+    readonly_fields = ("created_at", "updated_at")
     fieldsets = (
-        ('Información Básica', {
-            'fields': ('name', 'code', 'base_url')
-        }),
-        ('Configuración', {
-            'fields': ('is_active', 'scraping_enabled')
-        }),
-        ('Metadata', {
-            'fields': ('created_at', 'updated_at'),
-            'classes': ('collapse',)
-        }),
+        (_("Información Básica"), {"fields": ("name", "code", "base_url")}),
+        (_("Configuración"), {"fields": ("is_active", "scraping_enabled")}),
+        (_("Metadata"), {"fields": ("created_at", "updated_at"), "classes": ("collapse",)}),
     )
-    
+
+    actions = ["enable_scraping", "disable_scraping"]
+
     def get_queryset(self, request: HttpRequest) -> QuerySet[Store]:
-        """
-        Optimiza el queryset con prefetch de listings.
-        
-        Args:
-            request: HttpRequest del admin
-        
-        Returns:
-            QuerySet optimizado
-        """
         qs = super().get_queryset(request)
-        return qs.prefetch_related('listings')
-    
-    def get_listings_count(self, obj: Store) -> int:
-        """
-        Retorna el número de listings activos.
-        
-        Args:
-            obj: Instancia de Store
-        
-        Returns:
-            Número de listings activos
-        """
-        return obj.listings.filter(is_active=True).count()
-    get_listings_count.short_description = 'Listings activos'
-    get_listings_count.admin_order_field = 'listings__count'
-    
+        return qs.annotate(
+            listings_count=Count("listings", filter=Q(listings__is_active=True), distinct=True)
+        )
+
+    @admin.display(description=_("Listings activos"), ordering="listings_count")
+    def listings_count_display(self, obj: Store) -> int:
+        return int(getattr(obj, "listings_count", 0))
+
+    @admin.display(description=_("Estado"))
     def is_active_display(self, obj: Store) -> str:
-        """
-        Muestra el estado activo con color.
-        
-        Args:
-            obj: Instancia de Store
-        
-        Returns:
-            HTML con ícono de estado
-        """
         if obj.is_active:
-            return format_html(
-                '<span style="color: green;">✓ Activa</span>'
-            )
-        return format_html(
-            '<span style="color: red;">✗ Inactiva</span>'
-        )
-    is_active_display.short_description = 'Estado'
-    
+            return _colored("✓ Activa", "green")
+        return _colored("✗ Inactiva", "red")
+
+    @admin.display(description=_("Scraping"))
     def scraping_enabled_display(self, obj: Store) -> str:
-        """
-        Muestra el estado del scraping con color.
-        
-        Args:
-            obj: Instancia de Store
-        
-        Returns:
-            HTML con ícono de estado
-        """
         if obj.scraping_enabled:
-            return format_html(
-                '<span style="color: green;">✓ Habilitado</span>'
-            )
-        return format_html(
-            '<span style="color: orange;">✗ Deshabilitado</span>'
-        )
-    scraping_enabled_display.short_description = 'Scraping'
-    
-    actions = ['enable_scraping', 'disable_scraping']
-    
+            return _colored("✓ Habilitado", "green")
+        return _colored("✗ Deshabilitado", "orange")
+
+    @admin.action(description=_("Habilitar scraping"))
     def enable_scraping(self, request: HttpRequest, queryset: QuerySet[Store]) -> None:
-        """Acción para habilitar scraping en tiendas seleccionadas."""
         updated = queryset.update(scraping_enabled=True)
-        self.message_user(request, f'{updated} tienda(s) actualizadas.')
-    enable_scraping.short_description = 'Habilitar scraping'
-    
+        self.message_user(request, _("%(n)s tienda(s) actualizadas.") % {"n": updated})
+
+    @admin.action(description=_("Deshabilitar scraping"))
     def disable_scraping(self, request: HttpRequest, queryset: QuerySet[Store]) -> None:
-        """Acción para deshabilitar scraping en tiendas seleccionadas."""
         updated = queryset.update(scraping_enabled=False)
-        self.message_user(request, f'{updated} tienda(s) actualizadas.')
-    disable_scraping.short_description = 'Deshabilitar scraping'
+        self.message_user(request, _("%(n)s tienda(s) actualizadas.") % {"n": updated})
 
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
-    """
-    Admin para el modelo Category.
-    
-    Gestiona categorías jerárquicas con visualización de la
-    ruta completa y contador de productos.
-    
-    List Display:
-        - Nombre de la categoría
-        - Categoría padre
-        - Ruta completa
-        - Estado activo
-        - Contador de productos
-    
-    Features:
-        - Filtros por is_active y parent
-        - Búsqueda por nombre
-        - Visualización jerárquica
-    """
-    
-    list_display = (
-        'name',
-        'get_store_display',
-        'parent',
-        'get_full_path',
-        'is_active_display',
-        'get_products_count',
-        'url'
-    )
-    list_filter = ('is_active', 'store', 'parent')
-    search_fields = ('name',)
-    readonly_fields = ('created_at', 'updated_at')
-    raw_id_fields = ('parent',)
-    
-    fieldsets = (
-        ('Información Básica', {
-            'fields': ('store', 'name', 'parent', 'url')
-        }),
-        ('Contenido', {
-            'fields': ('description',)
-        }),
-        ('Estado', {
-            'fields': ('is_active',)
-        }),
-        ('Metadata', {
-            'fields': ('created_at', 'updated_at'),
-            'classes': ('collapse',)
-        }),
-    )
-    
-    def get_queryset(self, request: HttpRequest) -> QuerySet[Category]:
-        """
-        Optimiza el queryset con select_related y annotate.
-        
-        Args:
-            request: HttpRequest del admin
-        
-        Returns:
-            QuerySet optimizado
-        """
-        qs = super().get_queryset(request)
-        return qs.select_related('store', 'parent').annotate(
-            products_count=Count('products', distinct=True)
-        )
-    
-    def get_store_display(self, obj: Category) -> str:
-        """
-        Retorna el código y nombre de la tienda.
-        
-        Args:
-            obj: Instancia de Category
-        
-        Returns:
-            Código y nombre de tienda
-        """
-        return f"{obj.store.code} - {obj.store.name}"
-    get_store_display.short_description = 'Tienda'
-    get_store_display.admin_order_field = 'store__name'
+    """Admin para Category (categorías por tienda, jerárquicas)."""
 
-    def get_full_path(self, obj: Category) -> str:
-        """
-        Retorna la ruta completa de la categoría.
-        
-        Args:
-            obj: Instancia de Category
-        
-        Returns:
-            Ruta jerárquica completa
-        """
+    list_display = (
+        "name",
+        "store_display",
+        "parent",
+        "full_path_display",
+        "is_active_display",
+        "products_count_display",
+        "url",
+    )
+    list_filter = ("is_active", "store", "parent")
+    search_fields = ("name",)
+    readonly_fields = ("created_at", "updated_at")
+    raw_id_fields = ("parent",)
+    fieldsets = (
+        (_("Información Básica"), {"fields": ("store", "name", "parent", "url")}),
+        (_("Contenido"), {"fields": ("description",)}),
+        (_("Estado"), {"fields": ("is_active",)}),
+        (_("Metadata"), {"fields": ("created_at", "updated_at"), "classes": ("collapse",)}),
+    )
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[Category]:
+        qs = super().get_queryset(request)
+        return qs.select_related("store", "parent").annotate(
+            products_count=Count("products", distinct=True)
+        )
+
+    @admin.display(description=_("Tienda"), ordering="store__name")
+    def store_display(self, obj: Category) -> str:
+        return f"{obj.store.code} - {obj.store.name}"
+
+    @admin.display(description=_("Ruta completa"))
+    def full_path_display(self, obj: Category) -> str:
         return obj.get_full_path()
-    get_full_path.short_description = 'Ruta completa'
-    
-    def get_products_count(self, obj: Category) -> int:
-        """
-        Retorna el número de productos en la categoría.
-        
-        Args:
-            obj: Instancia de Category
-        
-        Returns:
-            Número de productos
-        """
-        return obj.products.count()
-    get_products_count.short_description = 'Productos'
-    get_products_count.admin_order_field = 'products_count'
-    
+
+    @admin.display(description=_("Productos"), ordering="products_count")
+    def products_count_display(self, obj: Category) -> int:
+        return int(getattr(obj, "products_count", 0))
+
+    @admin.display(description=_("Activa"))
     def is_active_display(self, obj: Category) -> str:
-        """Muestra el estado activo con color."""
-        if obj.is_active:
-            return format_html('<span style="color: green;">✓</span>')
-        return format_html('<span style="color: red;">✗</span>')
-    is_active_display.short_description = 'Activa'
+        return _colored(_icon_bool(obj.is_active), "green" if obj.is_active else "red")
 
 
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    """
-    Admin para el modelo Product.
-    
-    Gestiona productos con visualización del mejor precio
-    y número de tiendas donde está disponible.
-    
-    List Display:
-        - Nombre del producto
-        - Marca
-        - Categoría
-        - Mejor precio actual
-        - Número de tiendas
-        - Estado activo
-    
-    Features:
-        - Filtros por categoría, is_active y brand
-        - Búsqueda por nombre, marca y modelo
-        - Raw ID fields para optimizar selección de categoría
-        - Acciones en masa para activar/desactivar
-    """
-    
+    """Admin para Product (producto global)."""
+
     list_display = (
-        'name',
-        'brand',
-        'category',
-        'get_best_price',
-        'get_listings_count',
-        'is_active_display'
+        "name",
+        "brand",
+        "category",
+        "best_price_display",
+        "listings_count_display",
+        "is_active_display",
     )
-    list_filter = ('category', 'is_active', 'brand')
-    search_fields = ('name', 'brand', 'model')
-    raw_id_fields = ('category',)
-    readonly_fields = ('created_at', 'updated_at')
-    
+    list_filter = ("category", "is_active", "brand")
+    search_fields = ("name", "brand", "model")
+    raw_id_fields = ("category",)
+    readonly_fields = ("created_at", "updated_at")
     fieldsets = (
-        ('Información del Producto', {
-            'fields': ('name', 'brand', 'model')
-        }),
-        ('Clasificación', {
-            'fields': ('category',)
-        }),
-        ('Descripción', {
-            'fields': ('description',)
-        }),
-        ('Estado', {
-            'fields': ('is_active',)
-        }),
-        ('Metadata', {
-            'fields': ('created_at', 'updated_at'),
-            'classes': ('collapse',)
-        }),
+        (_("Información del Producto"), {"fields": ("name", "brand", "model")}),
+        (_("Clasificación"), {"fields": ("category",)}),
+        (_("Descripción"), {"fields": ("description",)}),
+        (_("Estado"), {"fields": ("is_active",)}),
+        (_("Metadata"), {"fields": ("created_at", "updated_at"), "classes": ("collapse",)}),
     )
-    
+
+    actions = ["activate_products", "deactivate_products"]
+
     def get_queryset(self, request: HttpRequest) -> QuerySet[Product]:
-        """
-        Optimiza el queryset con prefetch de listings y precios.
-        
-        Args:
-            request: HttpRequest del admin
-        
-        Returns:
-            QuerySet optimizado
-        """
         qs = super().get_queryset(request)
-        return qs.select_related('category').prefetch_related(
-            'listings',
-            'listings__store',
-            'listings__price_history'
+        # listings_count para ordenar/mostrar sin consultas extra.
+        qs = qs.select_related("category").annotate(
+            listings_count=Count("listings", filter=Q(listings__is_active=True), distinct=True)
+        ).prefetch_related(
+            "listings__store",
+            "listings__price_history",
         )
-    
-    def get_best_price(self, obj: Product) -> str:
-        """
-        Muestra el mejor precio disponible.
-        
-        Args:
-            obj: Instancia de Product
-        
-        Returns:
-            String formateado con precio y tienda
-        """
+        return qs
+
+    @admin.display(description=_("Mejor precio"))
+    def best_price_display(self, obj: Product) -> str:
         best = obj.get_best_price()
-        if best:
-            latest = best.get_latest_price()
-            if latest:
-                return format_html(
-                    '<strong>${}</strong> <span style="color: #666;">({}) </span>',
-                    f'{latest.price:,.0f}',
-                    best.store.code
-                )
-        return format_html('<span style="color: #999;">-</span>')
-    get_best_price.short_description = 'Mejor precio'
-    
-    def get_listings_count(self, obj: Product) -> str:
-        """
-        Muestra el número de tiendas donde está disponible.
-        
-        Args:
-            obj: Instancia de Product
-        
-        Returns:
-            Número de listings activos
-        """
-        count = obj.listings.filter(is_active=True).count()
+        if not best:
+            return _colored("-", "#999")
+
+        latest = best.get_latest_price()
+        if not latest:
+            return _colored("-", "#999")
+
+        return format_html(
+            '<strong>${}</strong> <span style="color: #666;">({})</span>',
+            _money(latest.price),
+            best.store.code,
+        )
+
+    @admin.display(description=_("Disponibilidad"), ordering="listings_count")
+    def listings_count_display(self, obj: Product) -> str:
+        count = int(getattr(obj, "listings_count", 0))
         if count > 0:
-            return format_html(
-                '<span style="color: green;">{} tienda(s)</span>',
-                count
-            )
-        return format_html('<span style="color: red;">0 tiendas</span>')
-    get_listings_count.short_description = 'Disponibilidad'
-    
+            return _colored(f"{count} tienda(s)", "green")
+        return _colored("0 tiendas", "red")
+
+    @admin.display(description=_("Activo"))
     def is_active_display(self, obj: Product) -> str:
-        """Muestra el estado activo con color."""
-        if obj.is_active:
-            return format_html('<span style="color: green;">✓</span>')
-        return format_html('<span style="color: red;">✗</span>')
-    is_active_display.short_description = 'Activo'
-    
-    actions = ['activate_products', 'deactivate_products']
-    
+        return _colored(_icon_bool(obj.is_active), "green" if obj.is_active else "red")
+
+    @admin.action(description=_("Activar productos seleccionados"))
     def activate_products(self, request: HttpRequest, queryset: QuerySet[Product]) -> None:
-        """Acción para activar productos seleccionados."""
         updated = queryset.update(is_active=True)
-        self.message_user(request, f'{updated} producto(s) activado(s).')
-    activate_products.short_description = 'Activar productos seleccionados'
-    
+        self.message_user(request, _("%(n)s producto(s) activado(s).") % {"n": updated})
+
+    @admin.action(description=_("Desactivar productos seleccionados"))
     def deactivate_products(self, request: HttpRequest, queryset: QuerySet[Product]) -> None:
-        """Acción para desactivar productos seleccionados."""
         updated = queryset.update(is_active=False)
-        self.message_user(request, f'{updated} producto(s) desactivado(s).')
-    deactivate_products.short_description = 'Desactivar productos seleccionados'
+        self.message_user(request, _("%(n)s producto(s) desactivado(s).") % {"n": updated})
 
 
 @admin.register(ProductListing)
 class ProductListingAdmin(admin.ModelAdmin):
-    """
-    Admin para el modelo ProductListing.
-    
-    Gestiona los listings de productos en tiendas específicas,
-    mostrando precio actual, descuento y disponibilidad.
-    
-    List Display:
-        - Nombre del producto
-        - Tienda
-        - Precio actual
-        - Descuento
-        - Disponibilidad
-        - Última actualización
-    
-    Features:
-        - Filtros por store, is_available e is_active
-        - Búsqueda por nombre de producto y URL
-        - Raw ID fields para optimizar selección
-        - Visualización de última fecha de scraping
-    """
-    
+    """Admin para ProductListing (producto por tienda)."""
+
     list_display = (
-        'get_product_name',
-        'store',
-        'get_current_price',
-        'get_discount',
-        'is_available_display',
-        'last_scraped_at'
+        "product_name",
+        "store",
+        "current_price_display",
+        "discount_display",
+        "is_available_display",
+        "last_scraped_at",
+        "is_active",
     )
-    list_filter = ('store', 'is_available', 'is_active')
-    search_fields = ('product__name', 'url')
-    raw_id_fields = ('product',)
-    readonly_fields = ('last_scraped_at', 'created_at', 'updated_at')
-    date_hierarchy = 'last_scraped_at'
-    
+    list_filter = ("store", "is_available", "is_active")
+    search_fields = ("product__name", "url")
+    raw_id_fields = ("product",)
+    readonly_fields = ("last_scraped_at", "created_at", "updated_at")
+    date_hierarchy = "last_scraped_at"
     fieldsets = (
-        ('Relaciones', {
-            'fields': ('product', 'store')
-        }),
-        ('Información de Tienda', {
-            'fields': ('url',)
-        }),
-        ('Disponibilidad', {
-            'fields': ('is_available', 'stock_status')
-        }),
-        ('Estado', {
-            'fields': ('is_active',)
-        }),
-        ('Metadata', {
-            'fields': ('last_scraped_at', 'created_at', 'updated_at'),
-            'classes': ('collapse',)
-        }),
+        (_("Relaciones"), {"fields": ("product", "store")}),
+        (_("Información de Tienda"), {"fields": ("url",)}),
+        (_("Disponibilidad"), {"fields": ("is_available", "stock_status")}),
+        (_("Estado"), {"fields": ("is_active",)}),
+        (_("Metadata"), {"fields": ("last_scraped_at", "created_at", "updated_at"), "classes": ("collapse",)}),
     )
-    
+
     def get_queryset(self, request: HttpRequest) -> QuerySet[ProductListing]:
-        """
-        Optimiza el queryset con select_related y prefetch.
-        
-        Args:
-            request: HttpRequest del admin
-        
-        Returns:
-            QuerySet optimizado
-        """
         qs = super().get_queryset(request)
-        return qs.select_related('product', 'store').prefetch_related(
-            'price_history'
-        )
-    
-    def get_product_name(self, obj: ProductListing) -> str:
-        """
-        Retorna el nombre del producto con link.
-        
-        Args:
-            obj: Instancia de ProductListing
-        
-        Returns:
-            Nombre del producto
-        """
+        return qs.select_related("product", "store").prefetch_related("price_history")
+
+    @admin.display(description=_("Producto"), ordering="product__name")
+    def product_name(self, obj: ProductListing) -> str:
         return obj.product.name
-    get_product_name.short_description = 'Producto'
-    get_product_name.admin_order_field = 'product__name'
-    
-    def get_current_price(self, obj: ProductListing) -> str:
-        """
-        Muestra el precio actual formateado.
-        
-        Args:
-            obj: Instancia de ProductListing
-        
-        Returns:
-            Precio formateado con color
-        """
+
+    @admin.display(description=_("Precio actual"))
+    def current_price_display(self, obj: ProductListing) -> str:
         latest = obj.get_latest_price()
-        if latest:
-            return format_html(
-                '<strong>${}</strong>',
-                f'{latest.price:,.0f}'
-            )
-        return format_html('<span style="color: #999;">Sin precio</span>')
-    get_current_price.short_description = 'Precio actual'
-    
-    def get_discount(self, obj: ProductListing) -> str:
-        """
-        Muestra el porcentaje de descuento.
-        
-        Args:
-            obj: Instancia de ProductListing
-        
-        Returns:
-            Descuento formateado con color
-        """
+        if not latest:
+            return _colored("Sin precio", "#999")
+        return format_html("<strong>${}</strong>", _money(latest.price))
+
+    @admin.display(description=_("Descuento"))
+    def discount_display(self, obj: ProductListing) -> str:
         discount = obj.get_discount_percentage()
         if discount > 0:
+            # quantize ya lo hace el modelo si usaste mi versión, pero esto es seguro.
             return format_html(
                 '<span style="color: green; font-weight: bold;">-{}%</span>',
-                discount
+                discount,
             )
-        return format_html('<span style="color: #999;">-</span>')
-    get_discount.short_description = 'Descuento'
-    
+        return _colored("-", "#999")
+
+    @admin.display(description=_("Disponibilidad"))
     def is_available_display(self, obj: ProductListing) -> str:
-        """
-        Muestra la disponibilidad con color.
-        
-        Args:
-            obj: Instancia de ProductListing
-        
-        Returns:
-            Estado de disponibilidad formateado
-        """
         if obj.is_available:
-            return format_html('<span style="color: green;">✓ Disponible</span>')
-        return format_html('<span style="color: red;">✗ No disponible</span>')
-    is_available_display.short_description = 'Disponibilidad'
+            return _colored("✓ Disponible", "green")
+        return _colored("✗ No disponible", "red")
 
 
 @admin.register(Price)
 class PriceAdmin(admin.ModelAdmin):
-    """
-    Admin para el modelo Price.
-    
-    Visualización de solo lectura del historial de precios.
-    No permite edición para mantener integridad del historial.
-    
-    List Display:
-        - Producto
-        - Tienda
-        - Precio
-        - Descuento (si aplica)
-        - Disponibilidad
-        - Fecha de registro
-    
-    Features:
-        - Filtros por is_available y fecha
-        - Búsqueda por nombre de producto
-        - Jerarquía por fecha
-        - Solo lectura (no editable)
-    """
-    
+    """Admin para Price (historial, solo lectura)."""
+
     list_display = (
-        'get_product',
-        'get_store',
-        'get_price_display',
-        'get_discount_display',
-        'is_available_display',
-        'recorded_at'
+        "product_display",
+        "store_display",
+        "price_display",
+        "discount_display",
+        "is_available_display",
+        "recorded_at",
     )
-    list_filter = ('is_available', 'recorded_at')
-    search_fields = ('listing__product__name',)
-    readonly_fields = ('listing', 'price', 'original_price', 'is_available', 'recorded_at')
-    date_hierarchy = 'recorded_at'
-    
+    list_filter = ("is_available", "recorded_at", "listing__store")
+    search_fields = ("listing__product__name",)
+    readonly_fields = ("listing", "price", "original_price", "is_available", "recorded_at")
+    date_hierarchy = "recorded_at"
+
     def has_add_permission(self, request: HttpRequest) -> bool:
-        """Deshabilita la creación manual de precios."""
         return False
-    
-    def has_change_permission(
-        self,
-        request: HttpRequest,
-        obj: Optional[Price] = None
-    ) -> bool:
-        """Deshabilita la edición de precios."""
+
+    def has_change_permission(self, request: HttpRequest, obj: Optional[Price] = None) -> bool:
         return False
-    
-    def has_delete_permission(
-        self,
-        request: HttpRequest,
-        obj: Optional[Price] = None
-    ) -> bool:
-        """Permite eliminación solo a superusuarios."""
-        return request.user.is_superuser
-    
+
+    def has_delete_permission(self, request: HttpRequest, obj: Optional[Price] = None) -> bool:
+        return bool(getattr(request.user, "is_superuser", False))
+
     def get_queryset(self, request: HttpRequest) -> QuerySet[Price]:
-        """
-        Optimiza el queryset con select_related.
-        
-        Args:
-            request: HttpRequest del admin
-        
-        Returns:
-            QuerySet optimizado
-        """
         qs = super().get_queryset(request)
-        return qs.select_related('listing__product', 'listing__store')
-    
-    def get_product(self, obj: Price) -> str:
-        """
-        Retorna el nombre del producto.
-        
-        Args:
-            obj: Instancia de Price
-        
-        Returns:
-            Nombre del producto
-        """
+        return qs.select_related("listing__product", "listing__store")
+
+    @admin.display(description=_("Producto"), ordering="listing__product__name")
+    def product_display(self, obj: Price) -> str:
         return obj.listing.product.name
-    get_product.short_description = 'Producto'
-    get_product.admin_order_field = 'listing__product__name'
-    
-    def get_store(self, obj: Price) -> str:
-        """
-        Retorna el nombre de la tienda.
-        
-        Args:
-            obj: Instancia de Price
-        
-        Returns:
-            Nombre de la tienda
-        """
+
+    @admin.display(description=_("Tienda"), ordering="listing__store__name")
+    def store_display(self, obj: Price) -> str:
         return obj.listing.store.name
-    get_store.short_description = 'Tienda'
-    get_store.admin_order_field = 'listing__store__name'
-    
-    def get_price_display(self, obj: Price) -> str:
-        """
-        Muestra el precio formateado.
-        
-        Args:
-            obj: Instancia de Price
-        
-        Returns:
-            Precio formateado
-        """
+
+    @admin.display(description=_("Precio"))
+    def price_display(self, obj: Price) -> str:
+        return format_html("<strong>${}</strong>", _money(obj.price))
+
+    @admin.display(description=_("Descuento"))
+    def discount_display(self, obj: Price) -> str:
+        if not obj.has_discount:
+            return _colored("-", "#999")
+
+        # Evitar división por cero aunque no debería pasar.
+        if not obj.original_price or obj.original_price <= 0:
+            return _colored("-", "#999")
+
+        discount_pct = ((obj.original_price - obj.price) / obj.original_price) * 100
         return format_html(
-            '<strong>${}</strong>',
-            f'{obj.price:,.0f}'
+            '<span style="color: green;">-{:.1f}%</span> <span style="color: #999;">(orig: ${})</span>',
+            float(discount_pct),
+            _money(obj.original_price),
         )
-    get_price_display.short_description = 'Precio'
-    
-    def get_discount_display(self, obj: Price) -> str:
-        """
-        Muestra el descuento si aplica.
-        
-        Args:
-            obj: Instancia de Price
-        
-        Returns:
-            Descuento formateado o guión
-        """
-        if obj.has_discount:
-            discount_pct = ((obj.original_price - obj.price) / obj.original_price) * 100
-            return format_html(
-                '<span style="color: green;">-{:.1f}%</span> <span style="color: #999;">(${:,.0f})</span>',
-                discount_pct,
-                obj.original_price
-            )
-        return format_html('<span style="color: #999;">-</span>')
-    get_discount_display.short_description = 'Descuento'
-    
+
+    @admin.display(description=_("Disponible"))
     def is_available_display(self, obj: Price) -> str:
-        """
-        Muestra la disponibilidad con color.
-        
-        Args:
-            obj: Instancia de Price
-        
-        Returns:
-            Estado de disponibilidad formateado
-        """
-        if obj.is_available:
-            return format_html('<span style="color: green;">✓</span>')
-        return format_html('<span style="color: red;">✗</span>')
-    is_available_display.short_description = 'Disponible'
+        return _colored(_icon_bool(obj.is_available), "green" if obj.is_available else "red")

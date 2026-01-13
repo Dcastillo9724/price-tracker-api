@@ -1,9 +1,11 @@
 """
 Views para la API de productos y tracking de precios.
 
-Este módulo contiene los ViewSets de DRF para manejar las operaciones
-CRUD y acciones personalizadas sobre productos, tiendas, categorías,
-listings y precios.
+Enfoque:
+- QuerySets optimizados (select_related / prefetch / annotate cuando aplica).
+- Validación defensiva de query params (sin “try/except pass” silencioso).
+- Acciones custom usando paginación DRF (paginate_queryset) en vez de slices “a mano”.
+- Evitar N+1: serializers dependen de relaciones precargadas en list/retrieve.
 
 ViewSets:
     - StoreViewSet: Gestión de tiendas
@@ -13,9 +15,24 @@ ViewSets:
     - PriceViewSet: Consulta de historial de precios (read-only)
 """
 
-from datetime import timedelta
+from __future__ import annotations
 
-from django.db.models import Avg, Count, F, Max, Min, OuterRef, Q, QuerySet, Subquery
+from datetime import timedelta
+from typing import Optional
+
+from django.db.models import (
+    Avg,
+    Count,
+    Exists,
+    F,
+    Max,
+    Min,
+    OuterRef,
+    Q,
+    QuerySet,
+    Subquery,
+)
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters, status, viewsets
@@ -38,650 +55,475 @@ from .serializers import (
 )
 
 
+def _parse_int(
+    request: Request,
+    name: str,
+    default: int,
+    *,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    raw = request.query_params.get(name, None)
+    if raw is None or raw == "":
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except (ValueError, TypeError):
+            raise ValueError(f"'{name}' debe ser un entero válido.")
+
+    if minimum is not None and value < minimum:
+        value = minimum
+    if maximum is not None and value > maximum:
+        value = maximum
+    return value
+
+
+def _parse_bool(request: Request, name: str, default: bool = False) -> bool:
+    raw = request.query_params.get(name, None)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "t", "yes", "y", "si", "sí"}
+
+
+def _latest_price_subquery(*, only_available: bool = True) -> Subquery:
+    """
+    Subquery para obtener el último precio (price) de un ProductListing.
+
+    Nota: Esto NO trae el objeto Price, sino el valor del campo solicitado.
+    """
+    qs = Price.objects.filter(listing=OuterRef("pk")).order_by("-recorded_at")
+    if only_available:
+        qs = qs.filter(is_available=True)
+    return Subquery(qs.values("price")[:1])
+
+
+def _latest_original_subquery(*, only_discounted: bool = False) -> Subquery:
+    """
+    Subquery para obtener el último original_price de un ProductListing.
+
+    only_discounted:
+        - True: solo considera registros con original_price > price.
+    """
+    qs = Price.objects.filter(listing=OuterRef("pk")).order_by("-recorded_at")
+    if only_discounted:
+        qs = qs.filter(original_price__isnull=False, original_price__gt=F("price"), is_available=True)
+    return Subquery(qs.values("original_price")[:1])
+
+
 class StoreViewSet(viewsets.ModelViewSet):
     """
-    ViewSet para gestión de tiendas.
-    
-    Proporciona operaciones CRUD completas para el modelo Store,
-    con filtrado por estado y búsqueda por nombre.
-    
-    Endpoints:
-        - GET /stores/ - Lista todas las tiendas
-        - POST /stores/ - Crea una nueva tienda
-        - GET /stores/{id}/ - Detalle de una tienda
-        - PUT /stores/{id}/ - Actualiza una tienda
-        - PATCH /stores/{id}/ - Actualización parcial
-        - DELETE /stores/{id}/ - Elimina una tienda
-        - GET /stores/{id}/listings/ - Listings de la tienda
-    
-    Filters:
-        - is_active: Filtrar por estado activo/inactivo
-        - scraping_enabled: Filtrar por scraping habilitado
-        - code: Filtrar por código de tienda
-    
-    Search:
-        - name: Buscar por nombre de tienda
-    
-    Examples:
-        GET /api/stores/?is_active=true
-        GET /api/stores/?search=mercado
-        GET /api/stores/1/listings/
+    CRUD de Store + acciones útiles.
+
+    Acciones:
+    - GET /stores/{id}/listings/
+    - POST /stores/{id}/toggle_scraping/
     """
-    
-    queryset = Store.objects.all()
+
     serializer_class = StoreSerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ['is_active', 'scraping_enabled', 'code']
-    search_fields = ['name']
-    
+    filterset_fields = ["is_active", "scraping_enabled", "code"]
+    search_fields = ["name"]
+
     def get_queryset(self) -> QuerySet[Store]:
+        qs = Store.objects.all()
+
+        # Soporta StoreSerializer.listings_count sin N+1
+        qs = qs.annotate(
+            listings_count=Count("listings", filter=Q(listings__is_active=True), distinct=True)
+        )
+
+        return qs
+
+    @action(detail=True, methods=["get"])
+    def listings(self, request: Request, pk: Optional[int] = None) -> Response:
         """
-        Retorna el queryset con prefetch optimizado.
-        
-        Returns:
-            QuerySet de Store con optimizaciones
-        """
-        queryset = super().get_queryset()
-        
-        if self.action == 'list':
-            queryset = queryset.prefetch_related('listings')
-        
-        return queryset
-    
-    @action(detail=True, methods=['get'])
-    def listings(self, request: Request, pk: int = None) -> Response:
-        """
-        Retorna los listings activos de una tienda.
-        
-        Args:
-            request: Request de DRF
-            pk: ID de la tienda
-        
-        Returns:
-            Response con lista de listings activos
-        
-        Examples:
-            GET /api/stores/1/listings/
-            GET /api/stores/1/listings/?limit=10
+        Listings activos de una tienda.
+
+        Query params:
+        - limit (opcional): limite duro (si no usas paginación global)
         """
         store = self.get_object()
-        listings = store.listings.filter(is_active=True).select_related(
-            'product', 'product__category'
-        ).prefetch_related('price_history')
-        
-        # Paginación opcional
-        limit = request.query_params.get('limit')
+
+        listings_qs = (
+            store.listings.filter(is_active=True)
+            .select_related("product", "product__category", "store")
+            .prefetch_related("price_history")
+        )
+
+        # Si tienes paginación configurada globalmente, esto funciona perfecto.
+        page = self.paginate_queryset(listings_qs)
+        if page is not None:
+            serializer = ListingListSerializer(page, many=True, context=self.get_serializer_context())
+            return self.get_paginated_response(serializer.data)
+
+        # Fallback si no hay paginación configurada
+        try:
+            limit = _parse_int(request, "limit", default=0, minimum=0, maximum=500)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
         if limit:
-            try:
-                listings = listings[:int(limit)]
-            except (ValueError, TypeError):
-                pass
-        
-        serializer = ListingListSerializer(listings, many=True)
+            listings_qs = listings_qs[:limit]
+
+        serializer = ListingListSerializer(listings_qs, many=True, context=self.get_serializer_context())
         return Response(serializer.data)
-    
-    @action(detail=True, methods=['post'])
-    def toggle_scraping(self, request: Request, pk: int = None) -> Response:
-        """
-        Activa/desactiva el scraping para una tienda.
-        
-        Args:
-            request: Request de DRF
-            pk: ID de la tienda
-        
-        Returns:
-            Response con estado actualizado de la tienda
-        
-        Examples:
-            POST /api/stores/1/toggle_scraping/
-        """
+
+    @action(detail=True, methods=["post"])
+    def toggle_scraping(self, request: Request, pk: Optional[int] = None) -> Response:
+        """Activa/desactiva scraping_enabled."""
         store = self.get_object()
         store.scraping_enabled = not store.scraping_enabled
-        store.save(update_fields=['scraping_enabled'])
-        
-        serializer = self.get_serializer(store)
-        return Response(serializer.data)
+        store.save(update_fields=["scraping_enabled"])
+        return Response(self.get_serializer(store).data)
 
 
 class CategoryViewSet(viewsets.ModelViewSet):
     """
-    ViewSet para gestión de categorías.
-    
-    Maneja categorías jerárquicas con soporte para árbol de categorías
-    y listado de productos por categoría.
-    
-    Endpoints:
-        - GET /categories/ - Lista todas las categorías activas
-        - POST /categories/ - Crea una nueva categoría
-        - GET /categories/{id}/ - Detalle de una categoría
-        - PUT /categories/{id}/ - Actualiza una categoría
-        - PATCH /categories/{id}/ - Actualización parcial
-        - DELETE /categories/{id}/ - Elimina una categoría
-        - GET /categories/{id}/products/ - Productos de la categoría
-        - GET /categories/tree/ - Árbol completo de categorías
-    
-    Filters:
-        - parent: Filtrar por categoría padre
-    
-    Search:
-        - name: Buscar por nombre de categoría
-    
-    Examples:
-        GET /api/categories/?parent__isnull=true  # Categorías raíz
-        GET /api/categories/1/products/
-        GET /api/categories/tree/
+    CRUD de Category + árbol y productos por categoría.
     """
-    
-    queryset = Category.objects.filter(is_active=True)
+
     serializer_class = CategorySerializer
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
-    filterset_fields = ['parent', 'store']
-    search_fields = ['name']
-    
+    filterset_fields = ["parent", "store"]
+    search_fields = ["name"]
+
     def get_queryset(self) -> QuerySet[Category]:
+        qs = Category.objects.filter(is_active=True).select_related("store", "parent")
+
+        # Soporta CategorySerializer.products_count sin N+1
+        qs = qs.annotate(products_count=Count("products", distinct=True))
+
+        return qs
+
+    @action(detail=True, methods=["get"])
+    def products(self, request: Request, pk: Optional[int] = None) -> Response:
         """
-        Retorna el queryset con optimizaciones.
-        
-        Returns:
-            QuerySet de Category con prefetch de relaciones
-        """
-        queryset = super().get_queryset()
-        
-        if self.action == 'list':
-            queryset = queryset.select_related('store', 'parent').prefetch_related('products')
-        
-        return queryset
-    
-    @action(detail=True, methods=['get'])
-    def products(self, request: Request, pk: int = None) -> Response:
-        """
-        Retorna los productos de una categoría.
-        
-        Incluye productos de subcategorías si se especifica el parámetro
-        include_children=true.
-        
-        Args:
-            request: Request de DRF
-            pk: ID de la categoría
-        
-        Query Params:
-            include_children: Incluir productos de subcategorías
-        
-        Returns:
-            Response con lista de productos
-        
-        Examples:
-            GET /api/categories/1/products/
-            GET /api/categories/1/products/?include_children=true
+        Productos de una categoría.
+
+        Query params:
+        - include_children: incluir subcategorías (default false)
         """
         category = self.get_object()
-        
-        # Opción para incluir subcategorías
-        include_children = request.query_params.get('include_children', 'false').lower() == 'true'
-        
+        include_children = _parse_bool(request, "include_children", default=False)
+
         if include_children:
-            # Obtener todas las subcategorías
             all_categories = [category] + category.get_all_children()
-            products = Product.objects.filter(
-                category__in=all_categories,
-                is_active=True
-            )
+            products_qs = Product.objects.filter(category__in=all_categories, is_active=True)
         else:
-            products = category.products.filter(is_active=True)
-        
-        products = products.select_related('category').prefetch_related('listings')
-        
-        serializer = ProductListSerializer(products, many=True)
+            products_qs = category.products.filter(is_active=True)
+
+        products_qs = (
+            products_qs.select_related("category")
+            .annotate(listings_count=Count("listings", distinct=True))
+            .order_by("-created_at")
+        )
+
+        page = self.paginate_queryset(products_qs)
+        if page is not None:
+            serializer = ProductListSerializer(page, many=True, context=self.get_serializer_context())
+            return self.get_paginated_response(serializer.data)
+
+        serializer = ProductListSerializer(products_qs, many=True, context=self.get_serializer_context())
         return Response(serializer.data)
-    
-    @action(detail=False, methods=['get'])
+
+    @action(detail=False, methods=["get"])
     def tree(self, request: Request) -> Response:
-        """
-        Retorna el árbol completo de categorías.
-        
-        Solo incluye categorías raíz con sus hijos anidados.
-        
-        Args:
-            request: Request de DRF
-        
-        Returns:
-            Response con árbol de categorías
-        
-        Examples:
-            GET /api/categories/tree/
-        """
-        root_categories = self.get_queryset().filter(parent__isnull=True)
-        serializer = CategoryTreeSerializer(root_categories, many=True)
+        """Árbol de categorías (solo raíces)."""
+        root_qs = self.get_queryset().filter(parent__isnull=True).prefetch_related("children")
+        serializer = CategoryTreeSerializer(root_qs, many=True, context=self.get_serializer_context())
         return Response(serializer.data)
 
 
 class ProductViewSet(viewsets.ModelViewSet):
     """
-    ViewSet para gestión de productos.
-    
-    Proporciona operaciones CRUD con búsqueda avanzada,
-    filtros por categoría/marca/precio y acciones especiales.
-    
-    Endpoints:
-        - GET /products/ - Lista productos con filtros
-        - POST /products/ - Crea un producto
-        - GET /products/{id}/ - Detalle de producto
-        - PUT /products/{id}/ - Actualiza producto
-        - PATCH /products/{id}/ - Actualización parcial
-        - DELETE /products/{id}/ - Elimina producto
-        - GET /products/best_deals/ - Mejores descuentos
-        - GET /products/price_alerts/ - Productos con alertas de precio
-    
-    Filters:
-        - category: ID de categoría
-        - is_active: Activo/inactivo
-        - brand: Marca del producto
-        - min_price: Precio mínimo
-        - max_price: Precio máximo
-    
-    Search:
-        - name, brand, model: Búsqueda por nombre, marca o modelo
-    
-    Ordering:
-        - name: Ordenar por nombre
-        - created_at: Ordenar por fecha de creación
-    
-    Examples:
-        GET /api/products/?category=1&brand=HP
-        GET /api/products/?min_price=1000000&max_price=3000000
-        GET /api/products/?search=laptop&ordering=-created_at
-        GET /api/products/best_deals/?limit=20
+    CRUD de Product + acciones:
+    - GET /products/best_deals/
+    - GET /products/trending/
     """
-    
-    queryset = Product.objects.select_related('category').all()
+
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ['category', 'is_active', 'brand']
-    search_fields = ['name', 'brand', 'model']
-    ordering_fields = ['name', 'created_at']
-    ordering = ['-created_at']
-    
+    filterset_fields = ["category", "is_active", "brand"]
+    search_fields = ["name", "brand", "model"]
+    ordering_fields = ["name", "created_at"]
+    ordering = ["-created_at"]
+
     def get_serializer_class(self):
-        """
-        Retorna el serializer apropiado según la acción.
-        
-        Returns:
-            Clase de serializer correspondiente
-        """
-        if self.action == 'list':
+        if self.action == "list":
             return ProductListSerializer
-        elif self.action in ['create', 'update', 'partial_update']:
+        if self.action in {"create", "update", "partial_update"}:
             return ProductCreateSerializer
         return ProductDetailSerializer
-    
+
     def get_queryset(self) -> QuerySet[Product]:
-        """
-        Retorna el queryset con filtros adicionales y optimizaciones.
-        
-        Aplica filtros de precio si se proporcionan en query params.
-        
-        Returns:
-            QuerySet filtrado y optimizado
-        """
-        queryset = super().get_queryset()
-        
-        # Optimizaciones según acción
-        if self.action == 'list':
-            queryset = queryset.prefetch_related('listings', 'listings__price_history')
-        elif self.action == 'retrieve':
-            queryset = queryset.prefetch_related(
-                'listings__store',
-                'listings__price_history'
+        qs = Product.objects.select_related("category").all()
+
+        # Soporta ProductListSerializer.listings_count sin N+1
+        qs = qs.annotate(listings_count=Count("listings", distinct=True))
+
+        # Prefetch para detalle/list (evita N+1 en best_price / listings)
+        if self.action == "list":
+            qs = qs.prefetch_related(
+                "listings__store",
+                "listings__price_history",
             )
-        
-        # Filtro por rango de precio
-        min_price = self.request.query_params.get('min_price')
-        max_price = self.request.query_params.get('max_price')
-        
+        elif self.action == "retrieve":
+            qs = qs.prefetch_related(
+                "listings__store",
+                "listings__price_history",
+            )
+
+        # Filtro por rango de precio basado en “último precio por listing”
+        min_price = self.request.query_params.get("min_price")
+        max_price = self.request.query_params.get("max_price")
         if min_price or max_price:
-            latest_prices = Price.objects.filter(
-                listing=OuterRef('listings'),
-                is_available=True
-            ).order_by('-recorded_at')
-            
-            queryset = queryset.annotate(
-                latest_price=Subquery(latest_prices.values('price')[:1])
+            try:
+                min_val = Decimal(min_price) if min_price else None
+                max_val = Decimal(max_price) if max_price else None
+            except Exception:
+                return qs.none()
+
+            listing_qs = (
+                ProductListing.objects.filter(product=OuterRef("pk"), is_active=True, is_available=True)
+                .annotate(latest_price=_latest_price_subquery(only_available=True))
+                .filter(latest_price__isnull=False)
             )
-            
-            if min_price:
-                queryset = queryset.filter(latest_price__gte=min_price)
-            if max_price:
-                queryset = queryset.filter(latest_price__lte=max_price)
-            
-            queryset = queryset.distinct()
-        
-        return queryset
-    
-    @action(detail=False, methods=['get'])
+            if min_val is not None:
+                listing_qs = listing_qs.filter(latest_price__gte=min_val)
+            if max_val is not None:
+                listing_qs = listing_qs.filter(latest_price__lte=max_val)
+
+            qs = qs.annotate(has_listing_in_range=Exists(listing_qs)).filter(has_listing_in_range=True)
+
+        return qs
+
+    @action(detail=False, methods=["get"])
     def best_deals(self, request: Request) -> Response:
         """
-        Retorna los productos con mejores descuentos.
-        
-        Ordena por diferencia entre precio original y precio actual,
-        mostrando los mayores descuentos primero.
-        
-        Args:
-            request: Request de DRF
-        
-        Query Params:
-            limit: Número de resultados (default: 20, max: 100)
-            min_discount: Porcentaje mínimo de descuento
-        
-        Returns:
-            Response con lista de listings con descuento
-        
-        Examples:
-            GET /api/products/best_deals/
-            GET /api/products/best_deals/?limit=50&min_discount=20
+        Listings con mejores descuentos (basado en último Price con descuento).
+
+        Query params:
+        - limit (default 20, max 100)
+        - min_discount (porcentaje entero o decimal, ej 20 o 20.5)
         """
-        limit = min(int(request.query_params.get('limit', 20)), 100)
-        min_discount = request.query_params.get('min_discount')
-        
-        # Subquery para obtener el último precio con descuento
-        latest_price_subquery = Price.objects.filter(
-            listing=OuterRef('pk'),
-            original_price__isnull=False,
-            original_price__gt=F('price'),
-            is_available=True
-        ).order_by('-recorded_at')
-        
-        listings = ProductListing.objects.filter(
-            is_active=True,
-            is_available=True,
-        ).annotate(
-            latest_price=Subquery(latest_price_subquery.values('price')[:1]),
-            latest_original=Subquery(latest_price_subquery.values('original_price')[:1])
-        ).filter(
-            latest_price__isnull=False,
-            latest_original__isnull=False
-        ).select_related('product', 'store')
-        
-        # Filtrar por porcentaje mínimo si se especifica
-        if min_discount:
+        try:
+            limit = _parse_int(request, "limit", default=20, minimum=1, maximum=100)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        min_discount_raw = request.query_params.get("min_discount")
+        min_discount_pct: Optional[Decimal] = None
+        if min_discount_raw:
             try:
-                min_discount_decimal = float(min_discount) / 100
-                listings = listings.filter(
-                    latest_price__lte=F('latest_original') * (1 - min_discount_decimal)
+                min_discount_pct = Decimal(str(min_discount_raw))
+            except Exception:
+                return Response(
+                    {"detail": "min_discount debe ser numérico (ej: 20 o 20.5)."},
+                    status=status.HTTP_400_BAD_REQUEST,
                 )
-            except (ValueError, TypeError):
-                pass
-        
-        # Ordenar por monto de descuento
-        listings = listings.order_by(
-            F('latest_original') - F('latest_price')
-        ).reverse()[:limit]
-        
-        serializer = ListingListSerializer(listings, many=True)
+
+        discounted_price_qs = Price.objects.filter(
+            listing=OuterRef("pk"),
+            original_price__isnull=False,
+            original_price__gt=F("price"),
+            is_available=True,
+        ).order_by("-recorded_at")
+
+        listings = (
+            ProductListing.objects.filter(is_active=True, is_available=True)
+            .select_related("product", "store")
+            .annotate(
+                latest_price=Subquery(discounted_price_qs.values("price")[:1]),
+                latest_original=Subquery(discounted_price_qs.values("original_price")[:1]),
+            )
+            .filter(latest_price__isnull=False, latest_original__isnull=False)
+        )
+
+        if min_discount_pct is not None:
+            # descuento% = (orig - price) / orig * 100
+            # => price <= orig * (1 - pct/100)
+            factor = (Decimal("100") - min_discount_pct) / Decimal("100")
+            listings = listings.filter(latest_price__lte=F("latest_original") * factor)
+
+        # Orden por monto descuento (orig - price) desc
+        listings = listings.order_by((F("latest_original") - F("latest_price")).desc())[:limit]
+
+        serializer = ListingListSerializer(listings, many=True, context=self.get_serializer_context())
         return Response(serializer.data)
-    
-    @action(detail=False, methods=['get'])
+
+    @action(detail=False, methods=["get"])
     def trending(self, request: Request) -> Response:
         """
-        Retorna productos con más cambios de precio recientes.
-        
-        Útil para identificar productos con precios volátiles o
-        promociones activas.
-        
-        Args:
-            request: Request de DRF
-        
-        Query Params:
-            days: Días a considerar (default: 7)
-            limit: Número de resultados (default: 20)
-        
-        Returns:
-            Response con productos ordenados por actividad de precio
-        
-        Examples:
-            GET /api/products/trending/
-            GET /api/products/trending/?days=14&limit=30
+        Productos con más registros de precio en una ventana reciente.
+
+        Query params:
+        - days (default 7, min 1, max 90)
+        - limit (default 20, min 1, max 100)
         """
-        days = int(request.query_params.get('days', 7))
-        limit = int(request.query_params.get('limit', 20))
-        
-        since_date = timezone.now() - timedelta(days=days)
-        
-        products_with_changes = Product.objects.filter(
-            listings__price_history__recorded_at__gte=since_date
-        ).annotate(
-            price_changes=Count('listings__price_history')
-        ).filter(
-            price_changes__gt=1,
-            is_active=True
-        ).order_by('-price_changes').select_related('category')[:limit]
-        
-        serializer = ProductListSerializer(products_with_changes, many=True)
+        try:
+            days = _parse_int(request, "days", default=7, minimum=1, maximum=90)
+            limit = _parse_int(request, "limit", default=20, minimum=1, maximum=100)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        since = timezone.now() - timedelta(days=days)
+
+        qs = (
+            Product.objects.filter(is_active=True, listings__price_history__recorded_at__gte=since)
+            .annotate(price_changes=Count("listings__price_history"))
+            .filter(price_changes__gt=1)
+            .select_related("category")
+            .annotate(listings_count=Count("listings", distinct=True))
+            .order_by("-price_changes")[:limit]
+        )
+
+        serializer = ProductListSerializer(qs, many=True, context=self.get_serializer_context())
         return Response(serializer.data)
 
 
 class ProductListingViewSet(viewsets.ModelViewSet):
     """
-    ViewSet para gestión de listings de productos.
-    
-    Maneja los listings de productos en tiendas específicas,
-    con historial de precios y actualización de scraping.
-    
-    Endpoints:
-        - GET /listings/ - Lista todos los listings
-        - POST /listings/ - Crea un listing
-        - GET /listings/{id}/ - Detalle de listing
-        - PUT /listings/{id}/ - Actualiza listing
-        - PATCH /listings/{id}/ - Actualización parcial
-        - DELETE /listings/{id}/ - Elimina listing
-        - GET /listings/{id}/price_history/ - Historial de precios
-        - POST /listings/{id}/update_availability/ - Actualiza disponibilidad
-    
-    Filters:
-        - store: ID de tienda
-        - product: ID de producto
-        - is_available: Disponible/no disponible
-        - is_active: Activo/inactivo
-    
-    Ordering:
-        - current_price: Ordenar por precio actual
-        - last_scraped_at: Ordenar por última actualización
-    
-    Examples:
-        GET /api/listings/?store=1&is_available=true
-        GET /api/listings/1/price_history/?days=30
-        POST /api/listings/1/update_availability/
+    CRUD de ProductListing + historial + actualización de disponibilidad.
     """
-    
-    queryset = ProductListing.objects.select_related('product', 'store').all()
+
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ['store', 'product', 'is_available', 'is_active']
-    ordering_fields = ['last_scraped_at']
-    ordering = ['-created_at']
-    
+    filterset_fields = ["store", "product", "is_available", "is_active"]
+    ordering_fields = ["last_scraped_at", "created_at"]
+    ordering = ["-created_at"]
+
     def get_serializer_class(self):
-        """Retorna el serializer apropiado según la acción."""
-        if self.action == 'list':
+        if self.action == "list":
             return ListingListSerializer
-        elif self.action in ['create', 'update', 'partial_update']:
+        if self.action in {"create", "update", "partial_update"}:
             return ListingCreateSerializer
         return ListingDetailSerializer
-    
+
     def get_queryset(self) -> QuerySet[ProductListing]:
-        """Retorna el queryset con optimizaciones."""
-        queryset = super().get_queryset()
-        
-        if self.action in ['list', 'retrieve']:
-            queryset = queryset.prefetch_related('price_history')
-        
-        return queryset
-    
-    @action(detail=True, methods=['get'])
-    def price_history(self, request: Request, pk: int = None) -> Response:
+        qs = ProductListing.objects.select_related("product", "store")
+
+        # Para list/retrieve: evitamos N+1 del serializer (precio actual/historial)
+        if self.action in {"list", "retrieve"}:
+            qs = qs.prefetch_related("price_history")
+
+        return qs
+
+    @action(detail=True, methods=["get"])
+    def price_history(self, request: Request, pk: Optional[int] = None) -> Response:
         """
-        Retorna el historial de precios del listing.
-        
-        Args:
-            request: Request de DRF
-            pk: ID del listing
-        
-        Query Params:
-            days: Días a consultar (default: 30)
-            limit: Máximo de registros (default: 100)
-        
-        Returns:
-            Response con historial de precios
-        
-        Examples:
-            GET /api/listings/1/price_history/
-            GET /api/listings/1/price_history/?days=60&limit=200
+        Historial de precios del listing.
+
+        Query params:
+        - days (default 30, min 1, max 365)
+        - limit (default 100, min 1, max 500)
         """
         listing = self.get_object()
-        days = int(request.query_params.get('days', 30))
-        limit = int(request.query_params.get('limit', 100))
-        
-        start_date = timezone.now() - timedelta(days=days)
-        prices = listing.price_history.filter(
-            recorded_at__gte=start_date
-        )[:limit]
-        
-        serializer = PriceSerializer(prices, many=True)
+
+        try:
+            days = _parse_int(request, "days", default=30, minimum=1, maximum=365)
+            limit = _parse_int(request, "limit", default=100, minimum=1, maximum=500)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        start = timezone.now() - timedelta(days=days)
+        prices_qs = listing.price_history.filter(recorded_at__gte=start).order_by("-recorded_at")[:limit]
+
+        serializer = PriceSerializer(prices_qs, many=True, context=self.get_serializer_context())
         return Response(serializer.data)
-    
-    @action(detail=True, methods=['post'])
-    def update_availability(self, request: Request, pk: int = None) -> Response:
+
+    @action(detail=True, methods=["post"])
+    def update_availability(self, request: Request, pk: Optional[int] = None) -> Response:
         """
-        Actualiza la disponibilidad del listing.
-        
-        Args:
-            request: Request de DRF con datos de disponibilidad
-            pk: ID del listing
-        
+        Actualiza disponibilidad del listing.
+
         Body:
-            is_available: bool
-            stock_status: str (opcional)
-        
-        Returns:
-            Response con listing actualizado
-        
-        Examples:
-            POST /api/listings/1/update_availability/
-            {
-                "is_available": false,
-                "stock_status": "Agotado"
-            }
+        - is_available: bool (requerido)
+        - stock_status: str (opcional)
         """
         listing = self.get_object()
-        
-        is_available = request.data.get('is_available')
-        stock_status = request.data.get('stock_status', '')
-        
-        if is_available is not None:
-            listing.is_available = is_available
-            listing.stock_status = stock_status
-            listing.update_scrape_timestamp()
-            
-            serializer = self.get_serializer(listing)
-            return Response(serializer.data)
-        
-        return Response(
-            {'error': 'Se requiere el campo is_available'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+
+        if "is_available" not in request.data:
+            return Response(
+                {"detail": "Se requiere el campo is_available."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        listing.is_available = bool(request.data.get("is_available"))
+        listing.stock_status = str(request.data.get("stock_status", "")).strip()
+        listing.update_scrape_timestamp()
+
+        serializer = self.get_serializer(listing, context=self.get_serializer_context())
+        return Response(serializer.data)
 
 
 class PriceViewSet(viewsets.ReadOnlyModelViewSet):
     """
-    ViewSet de solo lectura para precios.
-    
-    Permite consultar el historial de precios registrados
-    en el sistema. No permite crear/editar/eliminar precios
-    directamente (se crean mediante procesos de scraping).
-    
-    Endpoints:
-        - GET /prices/ - Lista precios recientes
-        - GET /prices/{id}/ - Detalle de un precio
-        - GET /prices/recent/ - Precios más recientes
-        - GET /prices/statistics/ - Estadísticas de precios
-    
-    Filters:
-        - listing: ID del listing
-        - is_available: Disponible/no disponible
-    
-    Ordering:
-        - recorded_at: Ordenar por fecha de registro (default: desc)
-    
-    Examples:
-        GET /api/prices/?listing=1
-        GET /api/prices/recent/?limit=100
-        GET /api/prices/statistics/?days=30
+    Consulta read-only de Price + acciones:
+    - GET /prices/recent/
+    - GET /prices/statistics/
     """
-    
-    queryset = Price.objects.select_related(
-        'listing__product',
-        'listing__store'
-    ).all()
+
     serializer_class = PriceSerializer
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
-    filterset_fields = ['listing', 'is_available']
-    ordering = ['-recorded_at']
-    
-    @action(detail=False, methods=['get'])
+    filterset_fields = ["listing", "is_available"]
+    ordering = ["-recorded_at"]
+
+    def get_queryset(self) -> QuerySet[Price]:
+        return Price.objects.select_related("listing__product", "listing__store")
+
+    @action(detail=False, methods=["get"])
     def recent(self, request: Request) -> Response:
         """
-        Retorna los precios registrados más recientemente.
-        
-        Args:
-            request: Request de DRF
-        
-        Query Params:
-            limit: Número de resultados (default: 50, max: 200)
-            hours: Horas a consultar (default: 24)
-        
-        Returns:
-            Response con precios recientes
-        
-        Examples:
-            GET /api/prices/recent/
-            GET /api/prices/recent/?limit=100&hours=12
+        Precios recientes.
+
+        Query params:
+        - limit (default 50, max 200)
+        - hours (default 24, min 1, max 168)
         """
-        limit = min(int(request.query_params.get('limit', 50)), 200)
-        hours = int(request.query_params.get('hours', 24))
-        
+        try:
+            limit = _parse_int(request, "limit", default=50, minimum=1, maximum=200)
+            hours = _parse_int(request, "hours", default=24, minimum=1, maximum=168)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
         since = timezone.now() - timedelta(hours=hours)
-        recent = self.get_queryset().filter(recorded_at__gte=since)[:limit]
-        
-        serializer = self.get_serializer(recent, many=True)
+        qs = self.get_queryset().filter(recorded_at__gte=since).order_by("-recorded_at")
+
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        serializer = self.get_serializer(qs[:limit], many=True)
         return Response(serializer.data)
-    
-    @action(detail=False, methods=['get'])
+
+    @action(detail=False, methods=["get"])
     def statistics(self, request: Request) -> Response:
         """
-        Retorna estadísticas globales de precios.
-        
-        Args:
-            request: Request de DRF
-        
-        Query Params:
-            days: Días a considerar (default: 30)
-        
-        Returns:
-            Response con estadísticas de precios
-        
-        Examples:
-            GET /api/prices/statistics/
-            GET /api/prices/statistics/?days=7
+        Estadísticas globales de precios (solo disponibles).
+
+        Query params:
+        - days (default 30, min 1, max 365)
         """
-        days = int(request.query_params.get('days', 30))
+        try:
+            days = _parse_int(request, "days", default=30, minimum=1, maximum=365)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
         since = timezone.now() - timedelta(days=days)
-        
-        stats = self.get_queryset().filter(
-            recorded_at__gte=since,
-            is_available=True
-        ).aggregate(
-            total_records=Count('id'),
-            avg_price=Avg('price'),
-            min_price=Min('price'),
-            max_price=Max('price'),
-            unique_listings=Count('listing', distinct=True)
+
+        stats = self.get_queryset().filter(recorded_at__gte=since, is_available=True).aggregate(
+            total_records=Count("id"),
+            avg_price=Avg("price"),
+            min_price=Min("price"),
+            max_price=Max("price"),
+            unique_listings=Count("listing", distinct=True),
         )
-        
+
+        # Normalización: evita nulls raros si no hay datos
+        stats["total_records"] = int(stats["total_records"] or 0)
+        stats["unique_listings"] = int(stats["unique_listings"] or 0)
+        stats["avg_price"] = stats["avg_price"]
+        stats["min_price"] = stats["min_price"]
+        stats["max_price"] = stats["max_price"]
+
         return Response(stats)

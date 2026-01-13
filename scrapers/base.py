@@ -35,9 +35,7 @@ class BaseScraper(ABC):
         self.wait: Optional[WebDriverWait] = None
         self.scraper_run: Optional[ScraperRun] = None
 
-    # ----------------------------
-    # Selenium lifecycle
-    # ----------------------------
+
     def setup_driver(self) -> None:
         self.driver, self.wait = SeleniumConfig.create_driver(headless=self.headless)
         logger.info("Driver configurado para %s", self.store.name)
@@ -50,9 +48,6 @@ class BaseScraper(ABC):
             except Exception as e:
                 logger.error("Error cerrando driver: %s", e, exc_info=True)
 
-    # ----------------------------
-    # Abstract API
-    # ----------------------------
     @abstractmethod
     def scrape_categories(self) -> List[Dict[str, Any]]:
         raise NotImplementedError
@@ -61,9 +56,6 @@ class BaseScraper(ABC):
     def scrape_products(self, category_url: str) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
-    # ----------------------------
-    # ScraperRun
-    # ----------------------------
     def start_run(self, trigger_type: str = "MANUAL") -> ScraperRun:
         self.scraper_run = ScraperRun.objects.create(
             store=self.store,
@@ -87,9 +79,6 @@ class BaseScraper(ABC):
 
         logger.info("ScraperRun finalizado: %s con estado %s", self.scraper_run.id, status)
 
-    # ----------------------------
-    # Error logging
-    # ----------------------------
     def log_error(
         self,
         error_type: str,
@@ -114,9 +103,6 @@ class BaseScraper(ABC):
 
         logger.error("Error registrado: %s - %s", error_type, error_message)
 
-    # ----------------------------
-    # Persistencia de categorías
-    # ----------------------------
     def save_category(
         self,
         *,
@@ -163,9 +149,7 @@ class BaseScraper(ABC):
 
         return count
 
-    # ----------------------------
-    # Persistencia de productos / precios
-    # ----------------------------
+
     @staticmethod
     def _to_decimal(value: Any) -> Optional[Decimal]:
         if value is None:
@@ -241,9 +225,6 @@ class BaseScraper(ABC):
 
         return listing
 
-    # ----------------------------
-    # Orquestación
-    # ----------------------------
     def run(self, *, trigger_type: str = "MANUAL", scrape_type: str = "categories") -> ScraperRun:
         try:
             self.start_run(trigger_type=trigger_type)

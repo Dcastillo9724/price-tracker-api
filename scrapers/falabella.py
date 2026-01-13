@@ -237,34 +237,20 @@ class FalabellaScraper(BaseScraper):
         except Exception:
             return None
 
-    # ----------------------------
-    # Productos (lógica del lab)
-    # ----------------------------
     def scrape_products(self, category_url: str) -> List[Dict[str, Any]]:
         logger.info("Scrapeando productos: %s", category_url)
-        results: List[Dict[str, Any]] = []
 
         try:
-            base_url = (category_url or "").strip()
-            if not base_url:
-                return results
-
-            self.driver.get(base_url)
+            self.driver.get(category_url)
             SeleniumHelpers.remove_overlays(self.driver)
 
             if self._is_no_result():
                 self._dump_debug("products_no_result_base")
-                return results
+                return []
 
             if not self._wait_products_container(timeout=25):
-                alt = self._ensure_is_plp(base_url)
-                if alt and alt != base_url:
-                    self.driver.get(alt)
-                    SeleniumHelpers.remove_overlays(self.driver)
-
-                if self._is_no_result() or not self._wait_products_container(timeout=25):
-                    self._dump_debug("products_base_not_loaded")
-                    return results
+                self._dump_debug("products_base_not_loaded")
+                return []
 
             SeleniumHelpers.remove_overlays(self.driver)
 
@@ -272,17 +258,18 @@ class FalabellaScraper(BaseScraper):
             if max_pages is None:
                 max_pages = 30
 
+            all_items: List[Dict[str, Any]] = []
             seen = set()
 
             page_items = self._extract_products_from_current_page()
-            for item in page_items:
-                u = item.get("url")
+            for it in page_items:
+                u = it.get("url")
                 if u and u not in seen:
                     seen.add(u)
-                    results.append(item)
+                    all_items.append(it)
 
             for page in range(2, max_pages + 1):
-                page_url = self._with_page_param(base_url, page)
+                page_url = self._build_page_url(category_url, page)
                 self.driver.get(page_url)
                 SeleniumHelpers.remove_overlays(self.driver)
 
@@ -290,6 +277,7 @@ class FalabellaScraper(BaseScraper):
                     break
 
                 if not self._wait_products_container(timeout=25):
+                    self._dump_debug(f"products_page_not_loaded_{page}")
                     break
 
                 SeleniumHelpers.remove_overlays(self.driver)
@@ -298,13 +286,13 @@ class FalabellaScraper(BaseScraper):
                 if not page_items:
                     break
 
-                for item in page_items:
-                    u = item.get("url")
+                for it in page_items:
+                    u = it.get("url")
                     if u and u not in seen:
                         seen.add(u)
-                        results.append(item)
+                        all_items.append(it)
 
-            return results
+            return all_items
 
         except Exception as e:
             logger.error("Error scrapeando productos: %s", e, exc_info=True)
@@ -314,55 +302,12 @@ class FalabellaScraper(BaseScraper):
                 url=category_url,
                 stack_trace=traceback.format_exc(),
             )
-            return results
+            return []
 
-    def _wait_products_container(self, timeout: int = 25) -> bool:
-        try:
-            self.wait.__class__(self.driver, timeout).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "#testId-searchResults-products"))
-            )
-            return True
-        except Exception:
-            return False
-
-    def _is_no_result(self) -> bool:
-        try:
-            url = (self.driver.current_url or "").lower()
-            if "/noresult" in url:
-                return True
-            body_txt = (self.driver.find_element(By.TAG_NAME, "body").text or "").lower()
-            return ("no encontramos resultados" in body_txt) or ("lo sentimos, no encontramos resultados" in body_txt)
-        except Exception:
-            return False
-
-    def _ensure_is_plp(self, url: str) -> Optional[str]:
-        try:
-            parsed = urlparse(url)
-            qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
-            if qs.get("isPLP") == "1":
-                return url
-            qs["isPLP"] = "1"
-            new_q = urlencode(qs, doseq=True)
-            return urlunparse(parsed._replace(query=new_q))
-        except Exception:
-            return None
-
-    @staticmethod
-    def _clean(text: str) -> str:
+    def _clean(self, text: str) -> str:
         return re.sub(r"\s+", " ", (text or "").replace("\n", " ")).strip()
 
-    @staticmethod
-    def _parse_price_attr(value: str) -> Optional[Decimal]:
-        if not value:
-            return None
-        v = value.strip().replace(".", "").replace(",", ".")
-        try:
-            return Decimal(v).quantize(Decimal("0.01"))
-        except Exception:
-            return None
-
-    @staticmethod
-    def _parse_price_text(text: str) -> Optional[Decimal]:
+    def _parse_price(self, text: str) -> Optional[Decimal]:
         if not text:
             return None
         t = text.replace("\xa0", " ")
@@ -375,12 +320,67 @@ class FalabellaScraper(BaseScraper):
         except Exception:
             return None
 
+    def _parse_price_attr(self, value: str) -> Optional[Decimal]:
+        if not value:
+            return None
+        v = value.strip().replace(".", "").replace(",", ".")
+        try:
+            return Decimal(v).quantize(Decimal("0.01"))
+        except Exception:
+            return None
+
+    def _is_no_result(self) -> bool:
+        url = (self.driver.current_url or "").lower()
+        if "/noresult" in url:
+            return True
+        try:
+            body_txt = (self.driver.find_element(By.TAG_NAME, "body").text or "").lower()
+            return ("no encontramos resultados" in body_txt) or ("lo sentimos, no encontramos resultados" in body_txt)
+        except Exception:
+            return False
+
+    def _wait_products_container(self, timeout: int = 25) -> bool:
+        try:
+            self.wait.__class__(self.driver, timeout).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#testId-searchResults-products"))
+            )
+            return True
+        except Exception:
+            return False
+
+    def _detect_max_pages(self) -> Optional[int]:
+        try:
+            containers = self.driver.find_elements(By.CSS_SELECTOR, "div[data-pagination-container='true']")
+            if not containers:
+                return None
+
+            btns = self.driver.find_elements(By.CSS_SELECTOR, "button[id^='testId-pagination-top-button']")
+            nums: List[int] = []
+            for b in btns:
+                t = self._clean(b.text)
+                if t.isdigit():
+                    nums.append(int(t))
+
+            return max(nums) if nums else None
+        except Exception:
+            return None
+
+    def _build_page_url(self, base_url: str, page: int) -> str:
+        parsed = urlparse(base_url)
+        q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        q["page"] = str(page)
+        new_query = urlencode(q, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
+
     def _extract_products_from_current_page(self) -> List[Dict[str, Any]]:
         products: List[Dict[str, Any]] = []
 
-        container = self.driver.find_element(By.CSS_SELECTOR, "#testId-searchResults-products")
-        anchors = container.find_elements(By.CSS_SELECTOR, "a[href*='/product/']")
+        try:
+            container = self.driver.find_element(By.CSS_SELECTOR, "#testId-searchResults-products")
+        except Exception:
+            return products
 
+        anchors = container.find_elements(By.CSS_SELECTOR, "a[href*='/product/']")
         seen_local = set()
 
         for a in anchors:
@@ -411,7 +411,7 @@ class FalabellaScraper(BaseScraper):
                             const el = arguments[0];
                             const out = [];
                             for (const a of el.attributes) {
-                              if (a.name.startsWith('data-') && a.name.endsWith('-price')) out.push(a.value);
+                                if (a.name.startsWith('data-') && a.name.endsWith('-price')) out.push(a.value);
                             }
                             return out;
                             """,
@@ -425,14 +425,14 @@ class FalabellaScraper(BaseScraper):
                     if not prices:
                         spans = pb.find_elements(By.XPATH, ".//*[contains(text(), '$')]")
                         for sp in spans:
-                            p = self._parse_price_text(sp.text)
+                            p = self._parse_price(sp.text)
                             if p is not None:
                                 prices.append(p)
 
                 if not prices:
                     any_price_nodes = card.find_elements(By.XPATH, ".//*[contains(text(), '$')]")
                     for n in any_price_nodes:
-                        p = self._parse_price_text(n.text)
+                        p = self._parse_price(n.text)
                         if p is not None:
                             prices.append(p)
 
@@ -443,9 +443,8 @@ class FalabellaScraper(BaseScraper):
                     {
                         "name": name or None,
                         "url": url,
-                        "price": price,
-                        "original_price": original_price,
-                        "is_available": True,
+                        "price": str(price) if price is not None else None,
+                        "original_price": str(original_price) if original_price is not None else None,
                     }
                 )
 
@@ -453,31 +452,6 @@ class FalabellaScraper(BaseScraper):
                 continue
 
         return products
-
-    def _detect_max_pages(self) -> Optional[int]:
-        try:
-            containers = self.driver.find_elements(By.CSS_SELECTOR, "div[data-pagination-container='true']")
-            if not containers:
-                return None
-
-            btns = self.driver.find_elements(By.CSS_SELECTOR, "button[id^='testId-pagination-top-button']")
-            nums: List[int] = []
-            for b in btns:
-                t = self._clean(b.text)
-                if t.isdigit():
-                    nums.append(int(t))
-
-            return max(nums) if nums else None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _with_page_param(url: str, page: int) -> str:
-        parsed = urlparse(url)
-        qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        qs["page"] = str(page)
-        new_q = urlencode(qs, doseq=True)
-        return urlunparse(parsed._replace(query=new_q))
 
     def _dump_debug(self, tag: str) -> None:
         try:
